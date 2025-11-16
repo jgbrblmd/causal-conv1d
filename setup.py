@@ -25,6 +25,7 @@ from torch.utils.cpp_extension import (
     CUDA_HOME,
     HIP_HOME,
 )
+import torch.utils.cpp_extension as cpp_ext
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -112,7 +113,8 @@ def check_if_hip_home_none(global_option: str) -> None:
 
 
 def check_if_cuda_home_none(global_option: str) -> None:
-    if CUDA_HOME is not None:
+    # Check the module-level CUDA_HOME (which may have been updated for ROCm)
+    if cpp_ext.CUDA_HOME is not None:
         return
     # warn instead of error because user could be downloading prebuilt wheels, so nvcc won't be necessary
     # in that case.
@@ -131,7 +133,123 @@ cmdclass = {}
 ext_modules = []
 
 
-HIP_BUILD = bool(torch.version.hip)
+# Detect ROCm environment more robustly
+# Check if torch has HIP support, or if ROCm environment variables are set, or if hipcc is available
+def detect_rocm_environment():
+    # Check if torch has HIP support
+    if torch.version.hip:
+        return True
+    # Check environment variables
+    if os.getenv("ROCM_PATH") is not None or os.getenv("HIP_HOME") is not None or HIP_HOME is not None:
+        return True
+    # Check if hipcc is available in PATH
+    try:
+        subprocess.check_output(["hipcc", "--version"], stderr=subprocess.DEVNULL, timeout=5)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+HIP_BUILD = detect_rocm_environment()
+
+# For ROCm builds, ensure ROCM_PATH and HIP_HOME are set
+# Do NOT set CUDA_HOME to ROCM_PATH, as PyTorch's CUDAExtension will look for nvcc there
+# Instead, let PyTorch detect ROCm automatically through HIP_HOME/ROCM_PATH
+if HIP_BUILD:
+    rocm_path = os.getenv("ROCM_PATH")
+    if not rocm_path or not os.path.exists(rocm_path):
+        # Try to find ROCm installation in common locations
+        common_rocm_paths = ["/opt/rocm", "/usr/local/rocm", "/usr/rocm"]
+        for path in common_rocm_paths:
+            if os.path.exists(path):
+                rocm_path = path
+                break
+    
+    if rocm_path and os.path.exists(rocm_path):
+        # Set ROCM_PATH if not already set
+        if not os.getenv("ROCM_PATH"):
+            os.environ["ROCM_PATH"] = rocm_path
+        
+        # Set HIP_HOME if not already set (PyTorch uses this to detect ROCm)
+        if not os.getenv("HIP_HOME") and HIP_HOME is None:
+            os.environ["HIP_HOME"] = rocm_path
+            # Update HIP_HOME in torch.utils.cpp_extension module
+            cpp_ext.HIP_HOME = rocm_path
+            import sys
+            if 'torch.utils.cpp_extension' in sys.modules:
+                sys.modules['torch.utils.cpp_extension'].HIP_HOME = rocm_path
+        
+        # For ROCm builds, PyTorch's CUDAExtension still requires CUDA_HOME to be set
+        # but it will use hipcc when it detects ROCm via HIP_HOME/torch.version.hip
+        # We need to set CUDA_HOME to ROCm path, but ensure PyTorch knows to use hipcc
+        if not os.getenv("CUDA_HOME") or os.getenv("CUDA_HOME") != rocm_path:
+            os.environ["CUDA_HOME"] = rocm_path
+            # Update CUDA_HOME in torch.utils.cpp_extension module
+            cpp_ext.CUDA_HOME = rocm_path
+            import sys
+            if 'torch.utils.cpp_extension' in sys.modules:
+                sys.modules['torch.utils.cpp_extension'].CUDA_HOME = rocm_path
+        
+        # Create a wrapper script for nvcc that calls hipcc
+        # This is needed because PyTorch's CUDAExtension looks for nvcc, but hipcc
+        # doesn't accept being called as nvcc. We create a wrapper script instead.
+        nvcc_path = os.path.join(rocm_path, "bin", "nvcc")
+        # Check for hipcc in common locations
+        hipcc_path = None
+        possible_hipcc_paths = [
+            os.path.join(rocm_path, "bin", "hipcc"),
+            "/usr/bin/hipcc",
+            shutil.which("hipcc") or "",
+        ]
+        for path in possible_hipcc_paths:
+            if path and os.path.exists(path):
+                hipcc_path = path
+                break
+        
+        if hipcc_path:
+            # Check if nvcc_path exists and is a symlink (from previous attempts)
+            # If so, we need to remove it and create a wrapper script instead
+            if os.path.exists(nvcc_path) or os.path.islink(nvcc_path):
+                try:
+                    if os.path.islink(nvcc_path):
+                        os.unlink(nvcc_path)
+                    elif os.path.exists(nvcc_path):
+                        # Check if it's already a wrapper script
+                        with open(nvcc_path, 'r') as f:
+                            content = f.read()
+                            if 'hipcc' not in content:
+                                os.remove(nvcc_path)
+                except (OSError, PermissionError):
+                    # If we can't remove it, warn the user
+                    warnings.warn(
+                        f"Found existing {nvcc_path} but cannot remove it. "
+                        "Please remove it manually and try again: "
+                        f"sudo rm {nvcc_path}",
+                        UserWarning
+                    )
+            
+            # Create a wrapper script that calls hipcc
+            if not os.path.exists(nvcc_path):
+                try:
+                    # Ensure the bin directory exists
+                    os.makedirs(os.path.dirname(nvcc_path), exist_ok=True)
+                    # Create a wrapper script
+                    wrapper_script = f"""#!/bin/bash
+# Wrapper script to make nvcc calls work with hipcc
+exec "{hipcc_path}" "$@"
+"""
+                    with open(nvcc_path, 'w') as f:
+                        f.write(wrapper_script)
+                    # Make it executable
+                    os.chmod(nvcc_path, 0o755)
+                except (OSError, PermissionError) as e:
+                    # If we can't create wrapper, print a warning with instructions
+                    warnings.warn(
+                        f"Could not create nvcc wrapper script: {e}. "
+                        "You may need to create it manually with root permissions. "
+                        f"Create {nvcc_path} with content: #!/bin/bash\\nexec {hipcc_path} \"$@\"",
+                        UserWarning
+                    )
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -164,43 +282,45 @@ if not SKIP_CUDA_BUILD:
     else:
         check_if_cuda_home_none(PACKAGE_NAME)
         # Check, if CUDA11 is installed for compute capability 8.0
+        # Use cpp_ext.CUDA_HOME to get the updated value
+        current_cuda_home = cpp_ext.CUDA_HOME
 
-        if CUDA_HOME is not None:
-            _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+        if current_cuda_home is not None:
+            _, bare_metal_version = get_cuda_bare_metal_version(current_cuda_home)
             if bare_metal_version < Version("11.6"):
                 raise RuntimeError(
                     f"{PACKAGE_NAME} is only supported on CUDA 11.6 and above.  "
                     "Note: make sure nvcc has a supported version by running nvcc -V."
                 )
 
-        if bare_metal_version <= Version("12.9"):
+            if bare_metal_version <= Version("12.9"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_62,code=sm_62")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_70,code=sm_70")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_72,code=sm_72")
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_62,code=sm_62")
+            cc_flag.append("arch=compute_75,code=sm_75")
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_70,code=sm_70")
+            cc_flag.append("arch=compute_80,code=sm_80")
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_72,code=sm_72")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_75,code=sm_75")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_87,code=sm_87")
-        if bare_metal_version >= Version("11.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
-        if bare_metal_version >= Version("12.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100,code=sm_100")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
-        if bare_metal_version >= Version("13.0"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_103,code=sm_103")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_110,code=sm_110")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_121,code=sm_121")
+            cc_flag.append("arch=compute_87,code=sm_87")
+            if bare_metal_version >= Version("11.8"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_90,code=sm_90")
+            if bare_metal_version >= Version("12.8"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_100,code=sm_100")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_120,code=sm_120")
+            if bare_metal_version >= Version("13.0"):
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_103,code=sm_103")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_110,code=sm_110")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_121,code=sm_121")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -276,7 +396,17 @@ def get_wheel_url():
     if HIP_BUILD:
         # We're using the HIP version used to build torch, not the one currently installed
         torch_hip_version = get_torch_hip_version()
-        hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
+        if torch_hip_version is not None:
+            hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
+        else:
+            # Fallback: try to get HIP version from system
+            rocm_home = os.getenv("ROCM_PATH")
+            _, hip_version_obj = get_hip_version(rocm_home)
+            if hip_version_obj is not None:
+                hip_version = f"{hip_version_obj.major}{hip_version_obj.minor}"
+            else:
+                # Default to 6.0 if we can't detect
+                hip_version = "60"
     else:
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
@@ -326,6 +456,12 @@ class CachedWheelsCommand(_bdist_wheel):
 
     def run(self):
         if FORCE_BUILD:
+            return super().run()
+
+        # For ROCm builds, skip trying to download prebuilt wheels as they are not available
+        # GitHub releases don't include ROCm wheels, so we should build from source directly
+        if HIP_BUILD:
+            print("ROCm build detected. Building from source (prebuilt wheels not available for ROCm)...")
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
